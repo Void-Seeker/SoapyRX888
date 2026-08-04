@@ -5,6 +5,7 @@
 #include <SoapySDR/Formats.hpp>
 
 #include <SoapySDR/Time.hpp>
+#include <chrono>
 #include <cstring>
 #include "SoapyRX888.hpp"
 
@@ -92,8 +93,31 @@ static void _rx_callback(unsigned char *buf, uint32_t len, void *ctx)
 void SoapyRX888::rx_async_operation(void)
 {
     //printf("rx_async_operation\n");
-    rx888_read_async(dev, &_rx_callback, this, asyncBuffs, bufferLength);
+    //this is the thread entry point: report errors, never throw out of here
+    const int ret = rx888_read_async(dev, &_rx_callback, this,
+            static_cast<uint32_t>(asyncBuffs), static_cast<uint32_t>(bufferLength));
+    if (ret != 0)
+    {
+        SoapySDR_logf(SOAPY_SDR_ERROR, "rx888_read_async() returned %d, streaming stopped", ret);
+    }
+    _asyncActive = false;
     //printf("rx_async_operation done!\n");
+}
+
+void SoapyRX888::stopAsyncThread(void)
+{
+    if (not _rx_async_thread.joinable()) return;
+
+    //rx888_cancel_async() is a no-op (-2) until the worker has reached the
+    //RX888_RUNNING state inside rx888_read_async(), so a single cancel issued
+    //during thread startup would be lost and join() would block forever.
+    //Retry until it takes, or until the worker has exited on its own.
+    while (_asyncActive and rx888_cancel_async(dev) != 0)
+    {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+
+    _rx_async_thread.join();
 }
 
 void SoapyRX888::rx_callback(unsigned char *buf, uint32_t len)
@@ -135,6 +159,32 @@ void SoapyRX888::rx_callback(unsigned char *buf, uint32_t len)
  * Stream API
  ******************************************************************/
 
+//Parse a positive integer stream argument, leaving the default in place
+//(with a warning) when the value is missing, malformed or out of range.
+static void parseSizeArg(const SoapySDR::Kwargs &args, const std::string &key, size_t &value)
+{
+    if (args.count(key) == 0) return;
+    const std::string &raw = args.at(key);
+    try
+    {
+        const int parsed = std::stoi(raw);
+        if (parsed > 0)
+        {
+            value = static_cast<size_t>(parsed);
+            return;
+        }
+        SoapySDR_logf(SOAPY_SDR_WARNING, "RX888 ignoring non-positive %s='%s'", key.c_str(), raw.c_str());
+    }
+    catch (const std::invalid_argument &)
+    {
+        SoapySDR_logf(SOAPY_SDR_WARNING, "RX888 ignoring malformed %s='%s'", key.c_str(), raw.c_str());
+    }
+    catch (const std::out_of_range &)
+    {
+        SoapySDR_logf(SOAPY_SDR_WARNING, "RX888 ignoring out-of-range %s='%s'", key.c_str(), raw.c_str());
+    }
+}
+
 SoapySDR::Stream *SoapyRX888::setupStream(
         const int direction,
         const std::string &format,
@@ -171,48 +221,24 @@ SoapySDR::Stream *SoapyRX888::setupStream(
     }
 
     bufferLength = DEFAULT_BUFFER_LENGTH;
-    if (args.count("bufflen") != 0)
+    parseSizeArg(args, "bufflen", bufferLength);
+    //the USB transfer length must be a multiple of 512. librx888 silently
+    //falls back to its own default when it is not, which would leave our ring
+    //buffers sized for one length while the callbacks deliver another --
+    //reject it here instead of streaming with a mismatched MTU.
+    if (bufferLength % 512 != 0)
     {
-        try
-        {
-            int bufferLength_in = std::stoi(args.at("bufflen"));
-            if (bufferLength_in > 0)
-            {
-                bufferLength = bufferLength_in;
-            }
-        }
-        catch (const std::invalid_argument &){}
+        throw std::runtime_error("setupStream: bufflen must be a multiple of 512, got "
+                + std::to_string(bufferLength));
     }
-    SoapySDR_logf(SOAPY_SDR_DEBUG, "RX888 Using buffer length %d", bufferLength);
+    SoapySDR_logf(SOAPY_SDR_DEBUG, "RX888 Using buffer length %zu", bufferLength);
 
     numBuffers = DEFAULT_NUM_BUFFERS;
-    if (args.count("buffers") != 0)
-    {
-        try
-        {
-            int numBuffers_in = std::stoi(args.at("buffers"));
-            if (numBuffers_in > 0)
-            {
-                numBuffers = numBuffers_in;
-            }
-        }
-        catch (const std::invalid_argument &){}
-    }
-    SoapySDR_logf(SOAPY_SDR_DEBUG, "RX888 Using %d buffers", numBuffers);
+    parseSizeArg(args, "buffers", numBuffers);
+    SoapySDR_logf(SOAPY_SDR_DEBUG, "RX888 Using %zu buffers", numBuffers);
 
     asyncBuffs = 0;
-    if (args.count("asyncBuffs") != 0)
-    {
-        try
-        {
-            int asyncBuffs_in = std::stoi(args.at("asyncBuffs"));
-            if (asyncBuffs_in > 0)
-            {
-                asyncBuffs = asyncBuffs_in;
-            }
-        }
-        catch (const std::invalid_argument &){}
-    }
+    parseSizeArg(args, "asyncBuffs", asyncBuffs);
 
     //clear async fifo counts
     _buf_tail = 0;
@@ -221,7 +247,6 @@ SoapySDR::Stream *SoapyRX888::setupStream(
 
     //allocate buffers
     _buffs.resize(numBuffers);
-    for (auto &buff : _buffs) buff.data.reserve(bufferLength);
     for (auto &buff : _buffs) buff.data.resize(bufferLength);
 
     return (SoapySDR::Stream *) this;
@@ -256,6 +281,8 @@ int SoapyRX888::activateStream(
     if (not _rx_async_thread.joinable())
     {
         //rx888_reset_buffer(dev);
+        //flag before spawning so a cancel racing startup cannot be dropped
+        _asyncActive = true;
         _rx_async_thread = std::thread(&SoapyRX888::rx_async_operation, this);
     }
 
@@ -267,11 +294,7 @@ int SoapyRX888::deactivateStream(SoapySDR::Stream *stream, const int flags, cons
     (void) timeNs; //unused
     (void) stream; //unused
     if (flags != 0) return SOAPY_SDR_NOT_SUPPORTED;
-    if (_rx_async_thread.joinable())
-    {
-        rx888_cancel_async(dev);
-        _rx_async_thread.join();
-    }
+    this->stopAsyncThread();
     return 0;
 }
 
@@ -311,27 +334,28 @@ int SoapyRX888::readStream(
     size_t returnedElems = std::min(bufferedElems, numElems);
 
     //convert into user's buff0
+    //NOTE: the samples are read out with memcpy rather than through an
+    //int16_t* cast -- the ring buffer is a char array, so punning it violates
+    //strict aliasing (this builds at -O3) and misaligns loads on ARM.
     if (rxFormat == RX888_RX_FORMAT_INT16)
     {
-        int16_t *itarget = reinterpret_cast<int16_t*>(buff0);
-        for (size_t i = 0; i < returnedElems; i++)
-        {
-        itarget[i] = *((int16_t*) &_currentBuff[2 * i]);
-        }
+        //native format: a straight copy of the ADC samples
+        std::memcpy(buff0, _currentBuff, returnedElems * BYTES_PER_SAMPLE);
     }
     else if (rxFormat == RX888_RX_FORMAT_FLOAT32)
     {
         float *ftarget = reinterpret_cast<float*>(buff0);
         for (size_t i = 0; i < returnedElems; i++)
         {
-        int16_t val = *((int16_t*) &_currentBuff[2 * i]);
+        int16_t val;
+        std::memcpy(&val, _currentBuff + BYTES_PER_SAMPLE * i, sizeof(val));
         ftarget[i * 2] = float(val) / 32768.0f;   // scale int16_t to [-1, 1] range.
         ftarget[i * 2 + 1] = 0.0f; // imaginary part is zero
         }
     }
     //bump variables for next call into readStream
     bufferedElems -= returnedElems;
-    _currentBuff += returnedElems * 2; // Each int16_t sample consists of 2 int8_t bytes
+    _currentBuff += returnedElems * BYTES_PER_SAMPLE;
     bufTicks += returnedElems; //for the next call to readStream if there is a remainder
 
     //return number of elements written to buff0
@@ -400,7 +424,7 @@ int SoapyRX888::acquireReadBuffer(
     bufTicks = _buffs[handle].tick;
     timeNs = SoapySDR::ticksToTimeNs(_buffs[handle].tick, sampleRate);
     buffs[0] = (void *)_buffs[handle].data.data();
-    flags = SOAPY_SDR_HAS_TIME;
+    flags |= SOAPY_SDR_HAS_TIME;
 
     //return number available
     return _buffs[handle].data.size() / BYTES_PER_SAMPLE;
@@ -413,5 +437,9 @@ void SoapyRX888::releaseReadBuffer(
     (void)stream; //unused
     (void)handle; //unused
     //TODO this wont handle out of order releases
-    _buf_count--;
+    //Guard against releasing a handle whose buffer was already dropped by a
+    //fifo drain (reset or overflow); an unconditional decrement would wrap the
+    //unsigned count and permanently defeat the overflow check in rx_callback.
+    //Only this thread drains or decrements, so the read-modify-write is safe.
+    if (_buf_count > 0) _buf_count--;
 }

@@ -196,40 +196,45 @@ private:
     rx888_dev_t *dev;
 
     //cached settings
-    uint8_t rfGain;
     rx888RXFormat rxFormat;
     uint32_t sampleRate;
     double centerFrequency;
     double rfAtten;       // HF DAT-31 attenuation in dB (<= 0)
     int ifGainIndex;      // HF AD8370 VGA step index (0..126)
-    size_t numBuffers, bufferLength, asyncBuffs;
-    std::atomic<long long> ticks;
+    //NOTE: atomics are not value-initialized before C++20, and this module
+    //builds as C++11 -- every member below needs an explicit initializer.
+    size_t numBuffers{DEFAULT_NUM_BUFFERS};
+    size_t bufferLength{DEFAULT_BUFFER_LENGTH};
+    size_t asyncBuffs{0};
+    std::atomic<long long> ticks{0};
 
 public:
 
     struct Buffer
     {
-        unsigned long long tick;
+        unsigned long long tick{0};
         std::vector<signed char> data;
     };
 
     //async api usage
     std::thread _rx_async_thread;
+    std::atomic<bool> _asyncActive{false};
     void rx_async_operation(void);
     void rx_callback(unsigned char *buf, uint32_t len);
+    void stopAsyncThread(void);
 
     std::mutex _buf_mutex;
     std::condition_variable _buf_cond;
 
     std::vector<Buffer> _buffs;
-    size_t	_buf_head;
-    size_t	_buf_tail;
-    std::atomic<size_t>	_buf_count;
-    signed char *_currentBuff;
-    std::atomic<bool> _overflowEvent;
-    size_t _currentHandle;
-    size_t bufferedElems;
-    long long bufTicks;
-    std::atomic<bool> resetBuffer;
-    
+    size_t	_buf_head{0};
+    size_t	_buf_tail{0};
+    std::atomic<size_t>	_buf_count{0};
+    signed char *_currentBuff{nullptr};
+    std::atomic<bool> _overflowEvent{false};
+    size_t _currentHandle{0};
+    size_t bufferedElems{0};
+    long long bufTicks{0};
+    std::atomic<bool> resetBuffer{false};
+
 };

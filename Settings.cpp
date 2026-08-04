@@ -12,15 +12,17 @@ static double rx888_if_index_to_db(int i)
     return 20.0 * std::log10(0.059 * (i + 1));
 }
 
-// Nearest VGA step index for a requested gain in dB.
+// Nearest VGA step index for a requested gain in dB. The mapping is monotonic,
+// so the search can stop as soon as the error starts growing again.
 static int rx888_if_db_to_index(double db)
 {
     int best = 0;
-    double bestErr = 1e9;
-    for (int i = 0; i <= 126; i++)
+    double bestErr = std::fabs(rx888_if_index_to_db(0) - db);
+    for (int i = 1; i <= 126; i++)
     {
         double err = std::fabs(rx888_if_index_to_db(i) - db);
-        if (err < bestErr) { bestErr = err; best = i; }
+        if (err >= bestErr) break;
+        bestErr = err; best = i;
     }
     return best;
 }
@@ -50,11 +52,23 @@ SoapyRX888::SoapyRX888(const SoapySDR::Kwargs &args):
         throw std::runtime_error("Unable to open RX888 device");
     }
 
-    
+    //rx888_open() starts the ADC with whatever rate the (zero-initialized)
+    //device struct holds, so push our default down before anyone reads it back.
+    if (rx888_set_sample_rate(dev, sampleRate) != 0)
+    {
+        SoapySDR_logf(SOAPY_SDR_ERROR, "rx888_set_sample_rate(%u) failed at open", sampleRate);
+    }
+    sampleRate = rx888_get_sample_rate(dev);
+    SoapySDR_logf(SOAPY_SDR_DEBUG, "RX888 initial sample rate: %u Hz", sampleRate);
 }
 
 SoapyRX888::~SoapyRX888(void)
 {
+    //stop the async thread before closing: rx888_close() spins until the async
+    //status goes inactive without cancelling it itself, and a still-joinable
+    //thread member would terminate() on destruction.
+    this->stopAsyncThread();
+
     //cleanup device handles
     rx888_close(dev);
 }
@@ -178,15 +192,29 @@ void SoapyRX888::setGain(const int direction, const size_t channel, const std::s
     (void)channel;
     if (name == "IF")
     {
-        ifGainIndex = rx888_if_db_to_index(value);
-        SoapySDR_logf(SOAPY_SDR_DEBUG, "Set IF (VGA) gain: %.1f dB -> index %d", value, ifGainIndex);
-        rx888_set_if_gain(dev, ifGainIndex);
+        const int index = rx888_if_db_to_index(value);
+        SoapySDR_logf(SOAPY_SDR_DEBUG, "Set IF (VGA) gain: %.1f dB -> index %d", value, index);
+        if (rx888_set_if_gain(dev, index) != 0)
+        {
+            throw std::runtime_error("setGain(IF) failed: rx888_set_if_gain()");
+        }
+        ifGainIndex = index;
     }
     else if (name == "RF")
     {
-        rfAtten = std::min(0.0, value);
-        SoapySDR_logf(SOAPY_SDR_DEBUG, "Set RF attenuation: %.1f dB", rfAtten);
-        rx888_set_hf_attenuation(dev, rfAtten);
+        const double atten = std::min(0.0, value);
+        SoapySDR_logf(SOAPY_SDR_DEBUG, "Set RF attenuation: %.1f dB", atten);
+        if (rx888_set_hf_attenuation(dev, atten) != 0)
+        {
+            throw std::runtime_error("setGain(RF) failed: rx888_set_hf_attenuation()");
+        }
+        rfAtten = atten;
+    }
+    else
+    {
+        //warn rather than throw: a stray element name from a host application
+        //should not take down the stream, but it should not vanish silently
+        SoapySDR_logf(SOAPY_SDR_WARNING, "setGain: ignoring unknown gain element '%s'", name.c_str());
     }
 }
 
@@ -203,6 +231,10 @@ SoapySDR::Range SoapyRX888::getGainRange(const int direction, const size_t chann
 {
     (void)direction;
     (void)channel;
+    //NOTE: the AD8370 splits into a low- and a high-gain range, so the step
+    //size is not uniform and there is a ~3.3 dB hole between the ranges
+    //(index 18 = 1.0 dB, index 19 = 4.3 dB). Requests landing in the hole snap
+    //to whichever end is nearer.
     if (name == "IF")  // AD8370 VGA, 127 steps
         return SoapySDR::Range(rx888_if_index_to_db(0), rx888_if_index_to_db(126));
     if (name == "RF")  // DAT-31 attenuator, 0.5 dB steps
@@ -273,11 +305,19 @@ void SoapyRX888::setSampleRate(const int direction, const size_t channel, const 
 {
     (void)direction;
     (void)channel;
-    long long ns = SoapySDR::ticksToTimeNs(ticks, sampleRate);
-    sampleRate = rate;
-    resetBuffer = true;
-    SoapySDR_logf(SOAPY_SDR_DEBUG, "Setting sample rate: %d", sampleRate);
-    int r = rx888_set_sample_rate(dev, sampleRate);
+    //reject before narrowing: an out-of-range double -> uint32_t is undefined
+    if (not (rate > 10000.0) or rate > 150000000.0)
+    {
+        throw std::runtime_error("setSampleRate failed: RX888 does not support "
+                + std::to_string(rate) + " Hz");
+    }
+    const uint32_t newRate = static_cast<uint32_t>(rate);
+
+    const long long ns = SoapySDR::ticksToTimeNs(ticks, sampleRate);
+    SoapySDR_logf(SOAPY_SDR_DEBUG, "Setting sample rate: %u", newRate);
+
+    //only commit the cached rate once the device has accepted it
+    int r = rx888_set_sample_rate(dev, newRate);
     if (r == -EINVAL)
     {
         throw std::runtime_error("setSampleRate failed: RX888 does not support this sample rate");
@@ -288,6 +328,7 @@ void SoapyRX888::setSampleRate(const int direction, const size_t channel, const 
     }
     sampleRate = rx888_get_sample_rate(dev);
     ticks = SoapySDR::timeNsToTicks(ns, sampleRate);
+    resetBuffer = true;
 }
 
 double SoapyRX888::getSampleRate(const int direction, const size_t channel) const
